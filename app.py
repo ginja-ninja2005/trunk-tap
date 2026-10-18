@@ -203,8 +203,9 @@ def api_tg_heatmap():
 @app.route("/api/graph/topology")
 def api_graph_topology():
     """Full network topology: systems -- sites, systems -- talkgroups,
-    RIDs -- TGs (transmissions), RIDs -- sites (sightings). Everything we
-    have detected as connected within the window, weighted by event count."""
+    RIDs -- TGs (transmissions), RIDs -- sites (sightings), TGs -- sites
+    (heard on). Everything we have detected as connected within the window,
+    weighted by event count."""
     hours = float(request.args.get("hours", 24))
     since = time.time() - hours * 3600
     c = db()
@@ -292,6 +293,21 @@ def api_graph_topology():
             add_node(rn, "rid", rid_alias.get((sid, rid)) or f"RID {rid}",
                      title=f"RID {rid}", dbid=rid)
         add_edge(rn, sn, r["n"], "seen")
+
+    # talkgroups -- sites (heard on). Without these, radios hang only off the
+    # site and talkgroups only off the system, and the force layout pulls a
+    # one-site network apart into two stars joined by the lone system--site
+    # edge. Only talkgroups already in the graph get an edge.
+    for r in c.execute("""SELECT e.system_id, e.site_id, e.to_tgid AS tgid,
+                                 COUNT(*) AS n
+                            FROM events e
+                           WHERE e.ts >= ? AND e.to_tgid IS NOT NULL
+                             AND e.site_id IS NOT NULL
+                           GROUP BY e.system_id, e.site_id, e.to_tgid""",
+                       (since,)):
+        tn, sn = f"tg:{r['system_id']}:{r['tgid']}", f"site:{r['site_id']}"
+        if tn in nodes and sn in nodes:
+            add_edge(tn, sn, r["n"], "heard")
 
     # Keep only nodes that participate in at least one edge -- the pane shows
     # what we have actually detected as connected, not every known entity.

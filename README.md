@@ -444,6 +444,15 @@ spread across real USB 3 controllers rather than one shared hub.
 - Encryption flag is inferred: for RDIO calls, zero-byte audio = encrypted;
   for event log rows, an EVENT starting with "Encrypted" or DETAILS containing
   "ENCRYPTED" / "ENCRYPTION:" = encrypted.
+- SDRTrunk's RDIO upload also carries the radio's Motorola **talker alias**
+  (`talkerAlias`, free text such as `BC911 4165226`; present on every upload,
+  usually empty). It is kept per call in `calls.talker_alias` (trimmed, a
+  `TA-` prefix dropped; the field as sent stays in `raw_json`), returned by
+  the call APIs next to `source_rid`, and shown in place of the bare RID
+  wherever a call's radio has no curated alias. It is per call on purpose:
+  SDRTrunk reports the first radio as `source` while the alias can come from
+  a later transmission in the same call. Existing databases gain the column
+  on the next boot (`db/__init__.py` `_migrate`).
 
 ## Legal & responsible use
 

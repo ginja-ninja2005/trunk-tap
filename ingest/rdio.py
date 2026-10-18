@@ -5,8 +5,8 @@ SDRTrunk streams every completed trunked call here as a multipart/form-data POST
 with the audio file plus metadata. Reference: https://github.com/chuot/rdio-scanner
 Fields SDRTrunk sends:
     key, audio (file), audioName, audioType, dateTime, frequency, frequencies,
-    patches, source, sources, system, systemLabel, talkgroup, talkgroupGroup,
-    talkgroupLabel, talkgroupTag
+    patches, source, sources, system, systemLabel, talkerAlias, talkgroup,
+    talkgroupGroup, talkgroupLabel, talkgroupTag
 """
 import json
 import os
@@ -44,6 +44,17 @@ def _jsonfield(x):
         return None
 
 
+def _talker_alias(x):
+    """talkerAlias form field -> cleaned text, or None when the radio sent none.
+    SDRTrunk always includes the field (usually ""), pads it with a trailing
+    space, and shows the same text elsewhere with a "TA-" prefix; the value
+    as sent survives in raw_json either way."""
+    x = (x or "").strip()
+    if x.startswith("TA-"):
+        x = x[3:].strip()
+    return x or None
+
+
 @bp.route("/api/call-upload", methods=["GET", "POST"])
 def call_upload():
     # SDRTrunk's RdioScannerBroadcaster pings this at startup as a health check
@@ -74,6 +85,7 @@ def call_upload():
     patches         = _jsonfield(form.get("patches"))
     source          = _int(form.get("source"))
     sources         = _jsonfield(form.get("sources"))
+    talker_alias    = _talker_alias(form.get("talkerAlias"))
     system_label    = form.get("systemLabel") or form.get("system") or "unknown"
     talkgroup       = _int(form.get("talkgroup"))
     talkgroup_grp   = form.get("talkgroupGroup")
@@ -143,11 +155,12 @@ def call_upload():
 
     c = db()
     cur = c.execute("""INSERT INTO calls(ts, system_id, site_id, talkgroup_id, tgid,
-                                         source_rid, sources_json, frequency, frequencies_json,
-                                         duration_ms, encrypted, patches_json, audio_path,
-                                         audio_type, audio_bytes, raw_json, transcribe_state)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (now, system_id, site_id, None, talkgroup, source,
+                                         source_rid, talker_alias, sources_json, frequency,
+                                         frequencies_json, duration_ms, encrypted, patches_json,
+                                         audio_path, audio_type, audio_bytes, raw_json,
+                                         transcribe_state)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now, system_id, site_id, None, talkgroup, source, talker_alias,
                      json.dumps(sources) if sources else None,
                      frequency,
                      json.dumps(frequencies) if frequencies else None,
@@ -193,6 +206,7 @@ def call_upload():
         "tg_group": talkgroup_grp,
         "source": source,
         "rid_alias": rid_alias,
+        "talker_alias": talker_alias,
         "frequency": frequency,
         "encrypted": bool(encrypted),
         "audio": audio_path,

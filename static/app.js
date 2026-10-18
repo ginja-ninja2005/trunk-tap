@@ -19,6 +19,9 @@
   const newBadge = ts => isNew(ts) ? ` <span class="badge-new">NEW</span>` : "";
   const esc = s => (s ?? "").toString()
       .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  // Radio label for a call row: curated alias, else the talker alias the radio
+  // sent with that call (SDRTrunk's talkerAlias form field), else the bare id.
+  const ridLabel = (rid, alias, ta) => esc(alias || ta || "") || "RID " + (rid ?? "?");
 
   // ---- RadioReference deep links ----
   // RR has per-SYSTEM pages only (no per-TG or per-RID pages), so every link
@@ -162,7 +165,7 @@
   const streamPasses = c =>
     streamMatch(streamTerms("stream-f-sys"), null, canonSys(c.system)) &&
     streamMatch(streamTerms("stream-f-tg"), c.tgid, streamTgName(c)) &&
-    streamMatch(streamTerms("stream-f-rid"), c.source, c.rid_alias);
+    streamMatch(streamTerms("stream-f-rid"), c.source, c.rid_alias || c.talker_alias);
 
   const streamCounts = () => {
     $("#stream-counts").textContent =
@@ -174,7 +177,7 @@
     const c = streamNowCall, name = streamTgName(c);
     el.innerHTML = `<span style="color:var(--neon-lime);font-size:10px;letter-spacing:2px">NOW PLAYING</span><br>
       ${fmtTs(c.ts)} · ${rrLink(c.system, name || "TG "+c.tgid)} <span style="color:var(--dim)">(${c.tgid})</span><br>
-      <span class="click-rid" data-rid="${c.source||""}">${esc(c.rid_alias||"") || "RID "+(c.source ?? "?")}</span>
+      <span class="click-rid" data-rid="${c.source||""}">${ridLabel(c.source, c.rid_alias, c.talker_alias)}</span>
       · <span style="color:var(--dim)">${fmtFreq(c.frequency)}</span>
       · <span style="color:var(--dim)">${esc(c.system||"")}</span>`;
   };
@@ -191,7 +194,7 @@
     log.insertAdjacentHTML("afterbegin", `<div class="tx-item">
       <span class="ts">${fmtTs(c.ts)}</span>
       <span class="rid click-tg" data-tg="${c.tgid||""}">${esc(streamTgName(c) || "TG "+c.tgid)}</span>
-      <span class="rid click-rid" data-rid="${c.source||""}">${esc(c.rid_alias||"") || "RID "+(c.source ?? "?")}</span>
+      <span class="rid click-rid" data-rid="${c.source||""}">${ridLabel(c.source, c.rid_alias, c.talker_alias)}</span>
       <span class="tx">${fmtFreq(c.frequency)}</span>
     </div>`);
     while (log.childElementCount > STREAM_MAXLOG) log.lastElementChild.remove();
@@ -257,7 +260,8 @@
     if (monitorTg && String(c.tgid) === monitorTg) {
       monitorCallId = c.id;
       monTx.textContent = "";
-      const who  = (c.rid_alias ? c.rid_alias + " " : "") + "RID " + (c.source || "?");
+      const name = c.rid_alias || c.talker_alias;
+      const who  = (name ? name + " " : "") + "RID " + (c.source || "?");
       const freq = c.frequency ? " · " + (c.frequency/1e6).toFixed(4) + " MHz" : "";
       if (c.frequency) monFreq.textContent = fmtFreq(c.frequency);
       if (c.encrypted || !c.audio) {
@@ -665,7 +669,7 @@
       $("#search-results").innerHTML = rows.map(r => `<div class="row ${r.encrypted?"enc":""}">
         <span class="ts">${fmtTs(r.ts)}</span>
         <span class="sys">${rrLink(r.system, r.system||"")}</span>
-        <span class="rid click-rid" data-rid="${r.source_rid||""}">RID ${esc(r.source_rid||"")}</span>
+        <span class="rid click-rid" data-rid="${r.source_rid||""}">${ridLabel(r.source_rid, null, r.talker_alias)}</span>
         <span class="tg"><span class="alias">${rrLink(r.system, r.tg_alias||"")}</span><span class="id click-tg" data-tg="${r.tgid||""}">${r.tgid||""}</span></span>
         <span class="meta">${r.encrypted?'<span class="enc">ENC</span>':""}</span>
         ${r.audio_path ? `<audio controls preload="none" src="/api/audio/${esc(r.audio_path)}"></audio>`:""}
@@ -1028,7 +1032,7 @@
     return `<div class="tx-item ${r.encrypted?"enc":""}" data-call="${r.id}">
       <span class="ts">${fmtTs(r.ts)}</span>
       <span class="rid click-tg" data-tg="${r.tgid||""}">${esc(alias || "TG "+(r.tgid||""))}</span>
-      <span class="rid click-rid" data-rid="${rid||""}">${esc(r.rid_alias||"") || "RID "+(rid ?? "?")}</span>
+      <span class="rid click-rid" data-rid="${rid||""}">${ridLabel(rid, r.rid_alias, r.talker_alias)}</span>
       <span class="freq">${fmtFreq(r.frequency)}</span>
       <button class="listen" data-listen-tg="${esc(r.tgid)}" data-listen-name="${esc(alias || "TG "+r.tgid)}" data-listen-freq="${r.frequency||""}">LISTEN</button>
       ${audio ? `<audio controls preload="none" src="/api/audio/${esc(audio)}"></audio>` : "<span></span>"}
@@ -1181,7 +1185,7 @@
     const encPct = d.enc_ratio?.total ? ((d.enc_ratio.enc/d.enc_ratio.total)*100).toFixed(1) : "0.0";
     const callsHtml = `<div class="mini-feed">${d.calls.map(c => `<div class="row ${c.encrypted?"enc":""}">
       <span class="ts">${fmtTs(c.ts)}</span>
-      <span class="rid click-rid" data-rid="${c.source_rid||""}">RID ${c.source_rid||""}</span>
+      <span class="rid click-rid" data-rid="${c.source_rid||""}">${ridLabel(c.source_rid, null, c.talker_alias)}</span>
       <span>${fmtDur(c.duration_ms)}</span>
       <span>${esc(c.transcript||"")}</span>
     </div>`).join("")||"<em>no calls</em>"}</div>`;

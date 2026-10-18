@@ -26,6 +26,21 @@ def _connect():
     return conn
 
 
+# Columns added after their table first shipped. schema.sql is all CREATE
+# TABLE IF NOT EXISTS, so a database created earlier never picks them up from
+# there; this adds whatever is missing on every boot (idempotent, additive).
+_MIGRATIONS = [
+    ("calls", "talker_alias", "TEXT"),
+]
+
+
+def _migrate(conn):
+    for table, column, decl in _MIGRATIONS:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db():
     global _INITIALIZED
     with _INIT_LOCK:
@@ -35,6 +50,7 @@ def init_db():
         conn = _connect()
         with open(SCHEMA_PATH) as f:
             conn.executescript(f.read())
+        _migrate(conn)
         conn.close()
         _INITIALIZED = True
 

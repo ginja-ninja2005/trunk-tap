@@ -109,8 +109,8 @@ def api_calls():
     limit = int(request.args.get("limit", 100))
     since = float(request.args.get("since", 0))
     system = request.args.get("system")
-    q = """SELECT c.id, c.ts, c.tgid, c.source_rid, c.frequency, c.duration_ms,
-                  c.encrypted, c.audio_path, c.transcript, c.transcribe_state,
+    q = """SELECT c.id, c.ts, c.tgid, c.source_rid, c.talker_alias, c.frequency,
+                  c.duration_ms, c.encrypted, c.audio_path, c.transcript, c.transcribe_state,
                   s.name AS system, tg.alias AS tg_alias, tg.tg_group,
                   r.alias AS rid_alias
              FROM calls c
@@ -378,8 +378,8 @@ def api_search():
         return jsonify([])
     limit = int(request.args.get("limit", 50))
     rows = db().execute(
-        """SELECT c.id, c.ts, c.tgid, c.source_rid, c.encrypted, c.audio_path,
-                  c.transcript, s.name AS system, tg.alias AS tg_alias
+        """SELECT c.id, c.ts, c.tgid, c.source_rid, c.talker_alias, c.encrypted,
+                  c.audio_path, c.transcript, s.name AS system, tg.alias AS tg_alias
              FROM calls_fts f
              JOIN calls c ON c.id=f.rowid
              LEFT JOIN systems s ON c.system_id=s.id
@@ -556,7 +556,8 @@ def api_rid_profile(rid):
                          WHERE r.rid=?""", (rid,)).fetchone()
     if not info:
         return jsonify({"error": "no such rid"}), 404
-    calls = c.execute("""SELECT ts, tgid, encrypted, frequency, duration_ms, transcript
+    calls = c.execute("""SELECT ts, tgid, talker_alias, encrypted, frequency, duration_ms,
+                                  transcript
                            FROM calls WHERE source_rid=? ORDER BY ts DESC LIMIT 200""",
                       (rid,)).fetchall()
     affs = c.execute("""SELECT tgid, COUNT(*) AS n, MAX(ts) AS last_ts
@@ -705,8 +706,8 @@ def api_transcripts():
     only_speech = request.args.get("only_speech", "0") == "1"
     system = request.args.get("system")
     tgid = request.args.get("tgid", type=int)
-    q = """SELECT c.id, c.ts, c.tgid, c.source_rid, c.frequency, c.duration_ms,
-                  c.encrypted, c.audio_path, c.transcript, c.transcript_engine,
+    q = """SELECT c.id, c.ts, c.tgid, c.source_rid, c.talker_alias, c.frequency,
+                  c.duration_ms, c.encrypted, c.audio_path, c.transcript, c.transcript_engine,
                   c.transcript_lang, c.transcript_ms, c.transcript_confidence,
                   sys.name AS system, tg.alias AS tg_alias, tg.tg_group,
                   r.alias AS rid_alias
@@ -740,8 +741,8 @@ def api_transcripts_grouped():
     only_speech = request.args.get("only_speech", "0") == "1"
     since = time.time() - hours * 3600
     q = """SELECT * FROM (
-               SELECT c.id, c.ts, c.tgid, c.source_rid, c.frequency, c.duration_ms,
-                      c.encrypted, c.audio_path, c.transcript, c.transcript_engine,
+               SELECT c.id, c.ts, c.tgid, c.source_rid, c.talker_alias, c.frequency,
+                      c.duration_ms, c.encrypted, c.audio_path, c.transcript, c.transcript_engine,
                       c.transcript_lang, c.transcript_ms, c.transcript_confidence,
                       c.system_id,
                       sys.name AS system, tg.alias AS tg_alias, tg.tg_group,
@@ -950,7 +951,8 @@ def api_tg_profile(tgid):
                          WHERE tg.tgid=?""", (tgid,)).fetchone()
     if not info:
         return jsonify({"error": "no such tg"}), 404
-    calls = c.execute("""SELECT ts, source_rid, encrypted, frequency, duration_ms, transcript
+    calls = c.execute("""SELECT ts, source_rid, talker_alias, encrypted, frequency,
+                                  duration_ms, transcript
                            FROM calls WHERE tgid=? ORDER BY ts DESC LIMIT 200""",
                       (tgid,)).fetchall()
     top_rids = c.execute("""SELECT source_rid AS rid, COUNT(*) AS n

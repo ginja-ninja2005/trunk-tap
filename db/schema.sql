@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS calls (
     talkgroup_id  INTEGER REFERENCES talkgroups(id),
     tgid          INTEGER,
     source_rid    INTEGER,
+    talker_alias  TEXT,               -- alias the radio sent with the call (SDRTrunk talkerAlias)
     sources_json  TEXT,               -- all RIDs that transmitted
     frequency     INTEGER,
     frequencies_json TEXT,             -- freq hops during call

@@ -307,7 +307,10 @@
   const bumpTile = (id, by) => {
     const el = document.getElementById(id);
     if (!el) return;
-    el.textContent = (parseInt(el.textContent||"0",10) + by).toLocaleString();
+    // the tile text is locale-formatted ("32,905"); strip separators before
+    // parsing or parseInt stops at the comma and the count collapses to 32
+    const cur = parseInt((el.textContent || "0").replace(/[^\d-]/g, ""), 10) || 0;
+    el.textContent = (cur + by).toLocaleString();
   };
 
   const tabActive = t => document.getElementById("tab-"+t)?.classList.contains("active");

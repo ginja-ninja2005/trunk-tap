@@ -8,13 +8,25 @@ services:
       # Your identity/coverage config (copy the *.example.json files in
       # config/ and edit). Read-only on purpose -- the app never writes here.
       - ./config:/app/config:ro
-      # SDRTrunk on the same host? Mount its dirs read-only to enable the
-      # live event-log tail and playlist alias import:
-      # - ~/SDRTrunk/event_logs:/sdrtrunk/event_logs:ro
-      # - ~/SDRTrunk/playlist:/sdrtrunk/playlist:ro
-      # - ~/SDRTrunk/configuration:/sdrtrunk/configuration:ro
+      # SDRTrunk on the same host: its dirs are mounted READ-ONLY so the
+      # container can tail the control-channel event logs, read the playlist
+      # (channel -> system/site, talkgroup aliases) and the tuner config.
+      # The app never writes under /sdrtrunk. Comment these out if SDRTrunk
+      # runs elsewhere (only RDIO call uploads flow in then).
+      - ~/SDRTrunk/event_logs:/sdrtrunk/event_logs:ro
+      - ~/SDRTrunk/playlist:/sdrtrunk/playlist:ro
+      - ~/SDRTrunk/configuration:/sdrtrunk/configuration:ro
+      # Where sdrtrunk-ingest `archive --apply` moves finished logs; swept
+      # read-only every 30 s so backfill still works after files are moved.
+      - ~/SDRTrunk/event_logs_archive:/sdrtrunk/event_logs_archive:ro
     environment:
-      TZ: UTC
+      # Must be the zone SDRTrunk's host runs in: SDRTrunk writes event-log
+      # timestamps as naive LOCAL wall-clock time, and the ±30 s event-to-call
+      # match (and the UI's clocks) depend on them lining up with the epoch
+      # timestamps of RDIO call uploads. SDRTRUNK_TZ overrides just the
+      # event-log interpretation if you want container logs in another zone.
+      TZ: America/Chicago
+      # SDRTRUNK_TZ: America/Chicago
       # Set to require an API key on /api/call-upload (must match SDRTrunk):
       # SDRTD_RDIO_KEY: change-me
       # Whisper model (default ggml-small.en.bin; tiny.en/base.en also work):

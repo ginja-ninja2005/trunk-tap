@@ -1,17 +1,33 @@
 """
 Tail SDRTrunk event log CSVs and ingest EVERY row.
 
-Each log filename encodes the channel: 20260310_133013.747_0_Hz_County-P25-East_call_events.log
+Each log filename encodes the channel: 20260310_133013.747_0_Hz_Control_call_events.log
 Header row:
   TIMESTAMP,DURATION_MS,PROTOCOL,EVENT,FROM,TO,CHANNEL_NUMBER,FREQUENCY,TIMESLOT,DETAILS,EVENT_ID
 
-We handle: log-rotate (new files appear), truncation, append.
+Row parsing lives in ingest/eventlog.py (stdlib only, unit-tested). This module
+owns the DB side and the folder watcher.
+
+Identity: a log's system and site come from the playlist channel it belongs to
+(channel name from the filename, "T-<name>" for traffic channels), then through
+canonical_system(), so events land under the same system as the RDIO call
+uploads. Without a readable playlist the channel name itself is used, as before.
+
+Watching: SDRTrunk never rotates or truncates, it just appends and flushes each
+line, and opens a new pair of files for every traffic-channel grant -- so the
+folder gathers thousands of header-only files per hour. Each tick lists the
+folder by name (cheap) and stats only files that were recently modified or
+that watchdog flagged; idle files are re-checked every 30 s, cold ones every
+10 min. Header-only files are never opened until they grow. An optional
+archive directory (where sdrtrunk-ingest moves finished files) is swept
+recursively every 30 s and each file in it is read once.
 """
 import csv
 import io
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -21,6 +37,7 @@ from watchdog.observers import Observer
 
 from db import (db, upsert_radio, upsert_site, upsert_system, upsert_talkgroup,
                 canonical_system)
+from ingest import eventlog
 
 # Per-system log files: every ingested event is also appended to
 # ~/Desktop/trunk-tap-export/logs/<System>.log as a normalized TSV row so
@@ -31,6 +48,14 @@ EXPORT_ROOT = Path(os.environ.get("SDRTD_EXPORT_DIR",
 SYSLOG_DIR = EXPORT_ROOT / "logs"
 SYSLOG_DIR.mkdir(parents=True, exist_ok=True)
 _syslog_lock = threading.Lock()
+
+SDRTRUNK_HOME = Path(os.environ.get("SDRTRUNK_HOME", Path.home() / "SDRTrunk"))
+PLAYLIST_PATH = Path(os.environ.get("SDRTRUNK_PLAYLIST",
+                                    SDRTRUNK_HOME / "playlist" / "default.xml"))
+
+# Only events this recent are pushed over the websocket; older ones are
+# backfill and reach the UI through /api/events instead.
+LIVE_WINDOW_S = 120
 
 
 def _syslog_name(label):
@@ -83,7 +108,7 @@ def _record_anomaly(ts, kind, system_id=None, site_id=None, rid=None, tgid=None,
     cur = c.execute("""INSERT INTO anomalies(ts, kind, system_id, site_id, rid, tgid, details)
                        VALUES (?,?,?,?,?,?,?)""",
                     (ts, kind, system_id, site_id, rid, tgid, details))
-    if socketio is not None:
+    if socketio is not None and time.time() - ts < LIVE_WINDOW_S:
         socketio.emit("anomaly", {
             "id": cur.lastrowid, "ts": ts, "kind": kind,
             "system_id": system_id, "site_id": site_id,
@@ -160,177 +185,142 @@ def _spike_check(system_id, from_rid, ts, socketio=None, window_sec=60, threshol
                         details=f"RID {from_rid} sent {count} events in {window_sec}s",
                         socketio=socketio)
 
-# ---- filename parsing --------------------------------------------------------
-_FNAME_RE = re.compile(
-    r"^(?P<date>\d{8})_(?P<time>\d{6}\.\d+)_\d+_Hz_(?P<label>.+?)_call_events\.log$"
-)
+
+# ---- filename / identity -----------------------------------------------------
+# Kept for callers that import these from here.
+system_label_from_filename = eventlog.system_label_from_filename
+_parse_ts = eventlog.parse_timestamp
 
 
-def system_label_from_filename(fname):
-    m = _FNAME_RE.match(fname)
-    if not m:
-        return None
-    label = m.group("label").replace("-", " ").replace("_", " ").strip()
-    return label
+class _Playlist:
+    """mtime-cached view of the playlist's channels: name -> system / site."""
+
+    def __init__(self, path=PLAYLIST_PATH):
+        self.path = Path(path)
+        self._mtime = None
+        self._map = {}
+        self._warned = False
+
+    def channel_map(self):
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            if self._map or not self._warned:
+                if not self._warned:
+                    print(f"[tail] playlist not readable at {self.path}; "
+                          f"using channel names as system labels", flush=True)
+                self._warned = True
+            self._map, self._mtime = {}, None
+            return self._map
+        if mtime != self._mtime:
+            self._map = eventlog.load_channel_map(self.path)
+            self._mtime = mtime
+            self._warned = False
+        return self._map
+
+    def identity(self, fname):
+        """(system_label, site_label) for a log file name."""
+        parsed = eventlog.parse_filename(fname)
+        channel = parsed["channel"] if parsed else None
+        system, site = eventlog.channel_identity(self.channel_map(), channel)
+        if not system:
+            system = eventlog.system_label_from_filename(fname) or Path(fname).stem
+            site = None
+        return canonical_system(system), site
 
 
-# ---- row parsing -------------------------------------------------------------
-_TG_ALIAS_RE = re.compile(r"^\[(.+?)\]\s*\((\d+)\)")   # "[County EMS Dispatch] (3001)"
-_TG_BARE_RE  = re.compile(r"^\s*\((\d+)\)")            # " (220026)"
-_ID_ONLY_RE  = re.compile(r"^\s*(\d+)\s*$")
+_playlist = _Playlist()
+
+# (system_label, site_label) -> (system_id, site_id, last_touch_ts). Saves a
+# SELECT+UPDATE per table per row; last_seen is still refreshed every 10 s.
+_ident_cache = {}
+_IDENT_REFRESH_S = 10
 
 
-def _parse_actor(field):
-    """Return (id, alias). Handles '[Label] (12345)', ' (12345)', '12345', ''."""
-    if not field:
-        return None, None
-    field = field.strip()
-    if not field:
-        return None, None
-    m = _TG_ALIAS_RE.match(field)
-    if m:
-        return int(m.group(2)), m.group(1)
-    m = _TG_BARE_RE.match(field)
-    if m:
-        return int(m.group(1)), None
-    m = _ID_ONLY_RE.match(field)
-    if m:
-        return int(m.group(1)), None
-    return None, field
-
-
-def _parse_ts(raw):
-    # "2026:03:10:13:30:18"
-    try:
-        parts = raw.split(":")
-        if len(parts) >= 6:
-            import datetime as _dt
-            dt = _dt.datetime(int(parts[0]), int(parts[1]), int(parts[2]),
-                              int(parts[3]), int(parts[4]), int(parts[5]))
-            return dt.timestamp()
-    except Exception:
-        pass
-    return time.time()
-
-
-def _int(x):
-    try:
-        return int(x) if x not in (None, "", " ") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _freq_hz(x):
-    """SDRTrunk logs frequency as MHz float e.g. 770.012500"""
-    try:
-        return int(float(x) * 1_000_000) if x not in (None, "", " ") else None
-    except (TypeError, ValueError):
-        return None
+def _resolve_ids(system_label, site_label, protocol, ts):
+    key = (system_label, site_label)
+    hit = _ident_cache.get(key)
+    if hit and abs(ts - hit[2]) < _IDENT_REFRESH_S:
+        return hit[0], hit[1]
+    system_id = upsert_system(system_label, protocol=protocol, label=system_label, now=ts)
+    site_id = (upsert_site(system_id, site_label, name=site_label, now=ts)
+               if site_label else None)
+    _ident_cache[key] = (system_id, site_id, ts)
+    return system_id, site_id
 
 
 # ---- ingestion ---------------------------------------------------------------
-def ingest_row(system_label, row, socketio=None):
-    # Unify site-specific log names ("County P25 East/West") with the network name
-    # used by RDIO uploads / playlist aliases ("Countywide") so events,
-    # calls, logs and transcripts all share one system identity.
+def ingest_row(system_label, row, socketio=None, site_label=None, event_scope=None):
+    """Ingest one CSV row (dict keyed by the header).
+
+    system_label: already the playlist/canonical name (see _Playlist.identity);
+    canonical_system() is applied again so direct callers get the same folding.
+    site_label:   the playlist channel's site, or None (sites are NOT derived
+                  from CHANNEL_NUMBER -- that is a P25 channel id).
+    event_scope:  the log's start stamp; EVENT_ID is only unique within one
+                  SDRTrunk run, so the stored id is "<scope>:<EVENT_ID>".
+    """
     system_label = canonical_system(system_label)
-    ts = _parse_ts(row.get("TIMESTAMP", ""))
-    duration = _int(row.get("DURATION_MS"))
-    protocol = row.get("PROTOCOL") or "APCO-25"
-    event_type = row.get("EVENT") or ""
-    from_field = row.get("FROM") or ""
-    to_field = row.get("TO") or ""
-    channel = row.get("CHANNEL_NUMBER") or ""
-    frequency = _freq_hz(row.get("FREQUENCY"))
-    timeslot = _int(row.get("TIMESLOT"))
-    details = row.get("DETAILS") or ""
-    ev_id = row.get("EVENT_ID") or None
+    e = eventlog.classify(row)
+    ts = e["ts"]
+    event_type = e["event_type"]
+    from_rid, to_tgid, to_rid = e["from_rid"], e["to_tgid"], e["to_rid"]
+    duration, frequency, details = e["duration_ms"], e["frequency"], e["details"]
+    encrypted = e["encrypted"]
+    ev_id = f"{event_scope}:{e['event_id']}" if (event_scope and e["event_id"]) else e["event_id"]
 
     if os.environ.get("SDRTD_DEBUG_TAIL") and "Call" in event_type:
         print(f"[debug] type={event_type!r} dur_raw={row.get('DURATION_MS')!r} "
-              f"dur={duration!r}", flush=True)
+              f"dur={duration!r} tg={to_tgid} rid={from_rid} enc={encrypted}", flush=True)
 
-    system_id = upsert_system(system_label, protocol=protocol, label=system_label, now=ts)
-
-    # CHANNEL_NUMBER often carries the site id as "1-1" — capture site
-    site_str = None
-    if channel and "-" in channel:
-        site_str = channel.split("-")[0]  # RFSS-SITE; keep just RFSS as site key
-        # Better: keep full "1-1" as our site key
-        site_str = channel
-    site_id = upsert_site(system_id, site_str, name=site_str, now=ts) if site_str else None
-
-    from_rid, from_alias = _parse_actor(from_field)
-    to_id, to_alias = _parse_actor(to_field)
-
-    # For Register/Response, SDRTrunk leaves FROM empty and puts the actor RID
-    # in TO. Promote it to from_rid so downstream analytics see the actor.
-    if event_type in ("Register", "Response") and from_rid is None and to_id is not None:
-        from_rid = to_id
-        to_id = None  # release TO -- affiliation TG comes from DETAILS
-
-    # Distinguish TG-directed events from unit calls.
-    to_tgid = None
-    to_rid  = None
-    if event_type in ("Group Call", "Data Call", "Response", "Register"):
-        if event_type == "Group Call":
-            to_tgid = to_id
-        elif event_type == "Data Call":
-            to_tgid = to_id
-        elif event_type == "Response":
-            # 'ACCEPTED AFFILIATION GROUP: 3001 (LOCAL) ANNOUNCEMENT GROUP:3000'
-            m = re.search(r"AFFILIATION GROUP:\s*(\d+)", details)
-            if m:
-                to_tgid = int(m.group(1))
-        elif event_type == "Register":
-            m = re.search(r"GROUP:\s*(\d+)", details)
-            if m:
-                to_tgid = int(m.group(1))
-    elif event_type == "Unit Call":
-        to_rid = to_id
-
-    encrypted = 0
-    if "ENCRYPT" in details.upper() or "SVC OPT" in details.upper() and "ENC" in details.upper():
-        encrypted = 1
+    system_id, site_id = _resolve_ids(system_label, site_label, e["protocol"], ts)
+    site_str = site_label
 
     # upserts
     if to_tgid is not None:
-        upsert_talkgroup(system_id, to_tgid, alias=to_alias, encrypted=bool(encrypted), now=ts)
+        upsert_talkgroup(system_id, to_tgid, alias=e["to_alias"],
+                         encrypted=bool(encrypted), now=ts)
     if from_rid is not None:
-        upsert_radio(system_id, from_rid, alias=from_alias, now=ts)
+        upsert_radio(system_id, from_rid, alias=e["from_alias"], now=ts)
     if to_rid is not None:
-        upsert_radio(system_id, to_rid, alias=to_alias, now=ts)
+        upsert_radio(system_id, to_rid, now=ts)
 
     c = db()
-    # Dedup by SDRTrunk's event_id (unique per event). SDRTrunk writes SEVERAL
-    # log rows per event as the call progresses -- the first row (the grant)
-    # usually has no DURATION_MS and no FROM; update rows fill them in later.
-    # So on re-observation, merge the new info into the existing row instead
-    # of just ignoring it, and re-emit when we learn who is talking.
+    # Dedup by SDRTrunk's event_id. SDRTrunk writes SEVERAL log rows per event
+    # as the call progresses -- the first row (the grant) usually has no
+    # DURATION_MS and no FROM; update rows fill them in, the duration grows,
+    # and the type can flip to "Encrypted ..." once the traffic channel shows
+    # encryption. So on re-observation merge the new info into the existing
+    # row, and re-emit when we learn who is talking.
     if ev_id is not None:
-        existing = c.execute("SELECT id, duration_ms, from_rid FROM events "
+        existing = c.execute("SELECT id, duration_ms, from_rid, encrypted FROM events "
                              "WHERE system_id=? AND event_id=?",
                              (system_id, ev_id)).fetchone()
     else:
         existing = None
     if existing is not None:
         learned_from = existing["from_rid"] is None and from_rid is not None
+        durs = [d for d in (existing["duration_ms"], duration) if d is not None]
+        new_dur = max(durs) if durs else None
         c.execute("""UPDATE events SET
-                         duration_ms = COALESCE(duration_ms, ?),
+                         duration_ms = ?,
                          from_rid    = COALESCE(from_rid, ?),
                          to_tgid     = COALESCE(to_tgid, ?),
                          to_rid      = COALESCE(to_rid, ?),
-                         frequency   = COALESCE(frequency, ?),
-                         encrypted   = MAX(encrypted, ?)
+                         frequency   = COALESCE(NULLIF(frequency, 0), ?),
+                         encrypted   = MAX(encrypted, ?),
+                         event_type  = ?,
+                         details     = ?
                      WHERE id=?""",
-                  (duration, from_rid, to_tgid, to_rid, frequency,
-                   encrypted, existing["id"]))
-        if learned_from and socketio is not None and time.time() - ts < 120:
+                  (new_dur, from_rid, to_tgid, to_rid, frequency,
+                   encrypted, event_type, details, existing["id"]))
+        if learned_from and socketio is not None and time.time() - ts < LIVE_WINDOW_S:
             socketio.emit("event", {
                 "ts": ts, "system": system_label, "type": event_type,
                 "from": from_rid, "to_tg": to_tgid, "to_rid": to_rid,
-                "site": site_str, "freq": frequency, "duration_ms": duration,
-                "encrypted": bool(encrypted), "details": details,
+                "site": site_str, "freq": frequency, "duration_ms": new_dur,
+                "encrypted": bool(encrypted or existing["encrypted"]),
+                "details": details,
             })
         return  # derived tables only on first sighting
 
@@ -339,16 +329,16 @@ def ingest_row(system_label, row, socketio=None):
                             frequency, timeslot, duration_ms, details, event_id,
                             encrypted)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (ts, system_id, site_id, protocol, event_type, from_rid,
-                     to_tgid, to_rid, channel, frequency, timeslot,
+                    (ts, system_id, site_id, e["protocol"], event_type, from_rid,
+                     to_tgid, to_rid, e["channel"], frequency, e["timeslot"],
                      duration, details, ev_id, encrypted))
 
     # Per-system log file (sortable TSV)
     try:
         syslog_event(system_label, ts, event_type, from_rid, to_tgid, to_rid,
                      site_str, frequency, duration, encrypted, details)
-    except Exception as e:
-        print(f"[syslog] err: {e!r}")
+    except Exception as ex:
+        print(f"[syslog] err: {ex!r}")
 
     # Side tables
     if event_type == "Response" and to_tgid is not None and from_rid is not None:
@@ -357,25 +347,32 @@ def ingest_row(system_label, row, socketio=None):
     if site_id is not None and from_rid is not None:
         c.execute("INSERT INTO roaming(ts, system_id, site_id, rid) VALUES (?,?,?,?)",
                   (ts, system_id, site_id, from_rid))
-    if "DENY" in event_type.upper() or "DENIED" in details.upper():
+    if e["deny"]:
         c.execute("INSERT INTO denies(ts, system_id, site_id, rid, tgid, reason) VALUES (?,?,?,?,?,?)",
                   (ts, system_id, site_id, from_rid, to_tgid, details))
     if "ADJACENT" in details.upper():
         c.execute("INSERT INTO adjacent_sites(ts, system_id, from_site_id, neighbor_site, frequency) VALUES (?,?,?,?,?)",
                   (ts, system_id, site_id, details, frequency))
     if "PATCH" in event_type.upper():
+        children = e["patch_members"] if e["patch_members"] is not None else {"details": details}
         c.execute("INSERT INTO patches(ts, system_id, supergroup, child_tgs) VALUES (?,?,?,?)",
-                  (ts, system_id, to_tgid, json.dumps({"details": details})))
+                  (ts, system_id, to_tgid, json.dumps(children)))
+        for child in (e["patch_members"] or []):
+            upsert_talkgroup(system_id, child, now=ts)
 
-    # Anomaly detection (novelty + spike). Runs after all upserts so first_seen
-    # comparison is meaningful.
+    # Anomaly detection (novelty + spike + emergency). Runs after all upserts
+    # so first_seen comparison is meaningful.
     try:
+        if e["emergency"]:
+            _record_anomaly(ts, "emergency", system_id=system_id, site_id=site_id,
+                            rid=from_rid, tgid=to_tgid,
+                            details=details or "EMERGENCY", socketio=socketio)
         _detect_novelty(system_id, site_id, from_rid, to_tgid, ts, socketio=socketio)
         _spike_check(system_id, from_rid, ts, socketio=socketio)
-    except Exception as e:
-        print(f"[anomaly] err: {e!r}")
+    except Exception as ex:
+        print(f"[anomaly] err: {ex!r}")
 
-    if socketio is not None:
+    if socketio is not None and time.time() - ts < LIVE_WINDOW_S:
         socketio.emit("event", {
             "ts": ts,
             "system": system_label,
@@ -392,88 +389,237 @@ def ingest_row(system_label, row, socketio=None):
 
 
 # ---- watcher -----------------------------------------------------------------
+class _FileState:
+    __slots__ = ("path", "name", "scope", "offset", "size", "mtime", "cols",
+                 "next_stat", "done", "rows")
+
+    def __init__(self, path, name, scope, offset=0):
+        self.path = path
+        self.name = name
+        self.scope = scope
+        self.offset = offset
+        self.size = None
+        self.mtime = None
+        self.cols = None
+        self.next_stat = 0.0
+        self.done = False       # immutable (archived) file fully read
+        self.rows = 0
+
+
 class _Tailer:
-    def __init__(self, log_dir, socketio=None):
+    """Follows one live folder plus optional archive folders.
+
+    State is keyed by file NAME (unique: start stamp + frequency + channel), so a
+    file that sdrtrunk-ingest moves into the archive is not read twice."""
+
+    IDLE_AFTER_S = 120      # mtime older than this: stat every SLOW_EVERY_S
+    COLD_AFTER_S = 3600     # ... older than this and fully read: every COLD_EVERY_S
+    SLOW_EVERY_S = 30
+    COLD_EVERY_S = 600
+    COMMIT_EVERY_ROWS = 500
+
+    def __init__(self, log_dir, socketio=None, archive_dirs=(), playlist=None):
         self.log_dir = Path(log_dir)
+        self.archive_dirs = [Path(p) for p in (archive_dirs or ()) if p]
         self.socketio = socketio
-        self.offsets = {}       # path -> byte offset
-        self.headers = {}       # path -> [col names]
+        self.playlist = playlist or _playlist
+        self.files = {}         # name -> _FileState
         self.lock = threading.Lock()
+        self._dirty = set()
+        self._dirty_lock = threading.Lock()
+        self._next_archive_scan = 0.0
+        self.stats = {"stats": 0, "reads": 0, "rows": 0, "files": 0}
+        self._state_loaded = False
+        self._saved_offsets = {}
 
-    def _load_state(self, path):
+    # -- persisted offsets --------------------------------------------------
+    def _load_saved_offsets(self):
+        if self._state_loaded:
+            return
         c = db()
-        row = c.execute("SELECT offset FROM ingest_state WHERE path=?", (str(path),)).fetchone()
-        return row["offset"] if row else 0
+        for r in c.execute("SELECT path, offset FROM ingest_state"):
+            # Older versions stored full paths; key by basename either way.
+            self._saved_offsets[Path(r["path"]).name] = r["offset"]
+        self._state_loaded = True
 
-    def _save_state(self, path, offset):
+    def _save_state(self, st):
         c = db()
         c.execute("""INSERT INTO ingest_state(path, offset, last_ts) VALUES(?,?,?)
                      ON CONFLICT(path) DO UPDATE SET offset=excluded.offset, last_ts=excluded.last_ts""",
-                  (str(path), offset, time.time()))
+                  (st.name, st.offset, time.time()))
 
+    # -- watchdog hook ------------------------------------------------------
+    def flag(self, path):
+        name = Path(path).name
+        if name.endswith(eventlog.CALL_EVENTS_SUFFIX):
+            with self._dirty_lock:
+                self._dirty.add(name)
+
+    # -- scanning -----------------------------------------------------------
     def scan_once(self):
+        now = time.time()
         with self.lock:
-            for path in sorted(self.log_dir.glob("*_call_events.log")):
-                self._read_new(path)
+            self._load_saved_offsets()
+            if self.log_dir.is_dir():
+                self._scan_dir(self.log_dir, now, recursive=False, immutable=False)
+            if self.archive_dirs and now >= self._next_archive_scan:
+                for d in self.archive_dirs:
+                    if d.is_dir():
+                        self._scan_dir(d, now, recursive=True, immutable=True)
+                self._next_archive_scan = now + self.SLOW_EVERY_S
+            with self._dirty_lock:
+                dirty, self._dirty = self._dirty, set()
+            for name in dirty:
+                st = self.files.get(name)
+                if st is not None and not st.done:
+                    self._check(st, now, immutable=False)
 
-    def _read_new(self, path):
+    def _iter_names(self, d, recursive):
+        if recursive:
+            for root, _dirs, names in os.walk(d):
+                for n in names:
+                    if n.endswith(eventlog.CALL_EVENTS_SUFFIX):
+                        yield Path(root) / n
+        else:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.name.endswith(eventlog.CALL_EVENTS_SUFFIX):
+                        yield Path(entry.path)
+
+    def _scan_dir(self, d, now, recursive, immutable):
         try:
-            size = path.stat().st_size
+            paths = list(self._iter_names(d, recursive))
+        except OSError as ex:
+            print(f"[tail] cannot list {d}: {ex!r}", flush=True)
+            return
+        for path in paths:
+            name = path.name
+            st = self.files.get(name)
+            if st is None:
+                parsed = eventlog.parse_filename(name)
+                scope = parsed["start"] if parsed else None
+                st = _FileState(path, name, scope, offset=self._saved_offsets.get(name, 0))
+                self.files[name] = st
+                self.stats["files"] += 1
+            elif st.path != path:
+                st.path = path          # moved (live -> archive)
+            if st.done:
+                continue
+            if now >= st.next_stat:
+                self._check(st, now, immutable)
+
+    def _check(self, st, now, immutable):
+        try:
+            stt = os.stat(st.path)
         except FileNotFoundError:
+            # moved away (archived) or deleted; the archive sweep will find it
+            st.next_stat = now + self.SLOW_EVERY_S
             return
-        offset = self.offsets.get(str(path))
-        if offset is None:
-            offset = self._load_state(path)
-        if offset > size:
-            # truncated / rotated
-            offset = 0
-        if offset >= size:
+        except OSError as ex:
+            print(f"[tail] stat {st.path}: {ex!r}", flush=True)
+            st.next_stat = now + self.SLOW_EVERY_S
             return
+        self.stats["stats"] += 1
+        size, mtime = stt.st_size, stt.st_mtime
+        st.size, st.mtime = size, mtime
+        if size < st.offset:
+            st.offset = 0           # truncated / replaced
+        # Header-only files (one per traffic-channel grant) are never opened
+        # until they grow past the header.
+        if size > st.offset and size > eventlog.HEADER_ONLY_BYTES:
+            self._read_new(st, size)
+        age = now - mtime
+        caught_up = st.offset >= size or size <= eventlog.HEADER_ONLY_BYTES
+        if immutable:
+            st.done = caught_up
+            st.next_stat = now + self.SLOW_EVERY_S
+        elif age > self.COLD_AFTER_S and caught_up:
+            st.next_stat = now + self.COLD_EVERY_S
+        elif age > self.IDLE_AFTER_S:
+            st.next_stat = now + self.SLOW_EVERY_S
+        else:
+            st.next_stat = 0.0
 
-        system_label = system_label_from_filename(path.name) or path.stem
-
-        with open(path, "rb") as f:
-            f.seek(offset)
-            chunk = f.read(size - offset)
-            new_offset = f.tell()
-
+    def _read_new(self, st, size):
+        try:
+            with open(st.path, "rb") as f:
+                f.seek(st.offset)
+                chunk = f.read(size - st.offset)
+                new_offset = f.tell()
+        except OSError as ex:
+            print(f"[tail] read {st.path}: {ex!r}", flush=True)
+            return
+        self.stats["reads"] += 1
         text = chunk.decode("utf-8", errors="replace")
+
         # If we started at 0, first line is header
-        if offset == 0:
+        if st.offset == 0:
             first_nl = text.find("\n")
             if first_nl == -1:
                 return
-            header_line = text[:first_nl]
-            self.headers[str(path)] = next(csv.reader(io.StringIO(header_line)))
+            st.cols = next(csv.reader(io.StringIO(text[:first_nl])))
             text = text[first_nl + 1:]
-        cols = self.headers.get(str(path))
-        if cols is None:
-            # need header — try to load it from file start
-            with open(path) as f:
-                header_line = f.readline()
-                cols = next(csv.reader(io.StringIO(header_line)))
-                self.headers[str(path)] = cols
+        if st.cols is None:
+            # resumed mid-file: load the header from the file start
+            try:
+                with open(st.path, encoding="utf-8", errors="replace") as f:
+                    st.cols = next(csv.reader(io.StringIO(f.readline())))
+            except (OSError, StopIteration):
+                st.cols = list(eventlog.HEADER)
+        cols = st.cols
 
         # Process only complete lines; keep tail for next round
         last_nl = text.rfind("\n")
         if last_nl == -1:
             return
         complete = text[:last_nl + 1]
-        remainder_bytes = len(text) - (last_nl + 1)
-        new_offset -= remainder_bytes
+        new_offset -= len(text) - (last_nl + 1)
 
-        reader = csv.reader(io.StringIO(complete))
-        for row_list in reader:
-            if not row_list:
-                continue
-            row = dict(zip(cols, row_list))
-            try:
-                ingest_row(system_label, row, self.socketio)
-            except Exception as e:
-                print(f"[tail] parse error in {path.name}: {e!r}")
+        system_label, site_label = self.playlist.identity(st.name)
 
-        self.offsets[str(path)] = new_offset
-        self._save_state(path, new_offset)
+        # One write transaction per chunk (committed every COMMIT_EVERY_ROWS
+        # rows so the RDIO upload handler and whisper worker never wait long).
+        # BEGIN IMMEDIATE takes the write lock up front: a deferred BEGIN would
+        # start on a read snapshot and every later write could fail with
+        # "database is locked" (SQLITE_BUSY_SNAPSHOT, which the busy timeout
+        # cannot retry) whenever another thread committed in between.
+        # Parse errors are per row; SQLite errors abort the chunk so the
+        # offset is not advanced past rows that were never stored.
+        c = db()
+        n = 0
+        in_tx = False
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            in_tx = True
+            for row_list in csv.reader(io.StringIO(complete)):
+                if not row_list:
+                    continue
+                row = dict(zip(cols, row_list))
+                try:
+                    ingest_row(system_label, row, self.socketio,
+                               site_label=site_label, event_scope=st.scope)
+                except sqlite3.Error:
+                    raise
+                except Exception as ex:
+                    print(f"[tail] parse error in {st.name}: {ex!r}", flush=True)
+                n += 1
+                if n % self.COMMIT_EVERY_ROWS == 0:
+                    c.execute("COMMIT")
+                    c.execute("BEGIN IMMEDIATE")
+            st.offset = new_offset
+            self._save_state(st)
+            c.execute("COMMIT")
+            in_tx = False
+        except Exception as ex:
+            print(f"[tail] {st.name}: {ex!r} (will retry)", flush=True)
+            if in_tx:
+                try:
+                    c.execute("ROLLBACK")
+                except Exception:
+                    pass
+            return
+        st.rows += n
+        self.stats["rows"] += n
 
 
 class _FSEvents(FileSystemEventHandler):
@@ -482,29 +628,60 @@ class _FSEvents(FileSystemEventHandler):
 
     def on_created(self, event):
         if not event.is_directory:
-            self.tailer.scan_once()
+            self.tailer.flag(event.src_path)
 
     def on_modified(self, event):
         if not event.is_directory:
-            self.tailer.scan_once()
+            self.tailer.flag(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self.tailer.flag(getattr(event, "dest_path", event.src_path))
 
 
-def start_tail(log_dir, socketio=None, poll_interval=1.0):
-    tailer = _Tailer(log_dir, socketio=socketio)
-    tailer.scan_once()
+def default_archive_dirs():
+    """SDRTD_ARCHIVE_DIRS (os.pathsep separated) or <SDRTRUNK_HOME>/event_logs_archive."""
+    raw = os.environ.get("SDRTD_ARCHIVE_DIRS")
+    if raw is not None:
+        return [Path(p) for p in raw.split(os.pathsep) if p]
+    return [SDRTRUNK_HOME / "event_logs_archive"]
 
-    observer = Observer()
-    observer.schedule(_FSEvents(tailer), str(log_dir), recursive=False)
-    observer.daemon = True
-    observer.start()
+
+def start_tail(log_dir, socketio=None, poll_interval=1.0, archive_dirs=None):
+    """Start following `log_dir` (and any existing archive dirs) in a daemon
+    thread. The initial backfill of existing files runs in that thread too so
+    the HTTP server comes up immediately."""
+    if archive_dirs is None:
+        archive_dirs = [d for d in default_archive_dirs() if d.is_dir()]
+    tailer = _Tailer(log_dir, socketio=socketio, archive_dirs=archive_dirs)
+
+    zone = eventlog.event_zone()
+    print(f"[tail] zone for SDRTrunk timestamps: {zone or 'process local'}; "
+          f"playlist: {PLAYLIST_PATH} ({'found' if PLAYLIST_PATH.exists() else 'missing'}); "
+          f"archive dirs: {[str(d) for d in tailer.archive_dirs] or 'none'}", flush=True)
+
+    try:
+        observer = Observer()
+        observer.schedule(_FSEvents(tailer), str(log_dir), recursive=False)
+        observer.daemon = True
+        observer.start()
+    except Exception as ex:
+        print(f"[tail] watchdog unavailable ({ex!r}); polling only", flush=True)
 
     def _poll():
+        t0 = time.time()
+        try:
+            tailer.scan_once()
+            print(f"[tail] backfill done: {tailer.stats['files']} files, "
+                  f"{tailer.stats['rows']} rows in {time.time() - t0:.1f}s", flush=True)
+        except Exception as ex:
+            print(f"[tail] initial scan error: {ex!r}", flush=True)
         while True:
             time.sleep(poll_interval)
             try:
                 tailer.scan_once()
-            except Exception as e:
-                print(f"[tail] scan error: {e!r}")
+            except Exception as ex:
+                print(f"[tail] scan error: {ex!r}", flush=True)
 
     t = threading.Thread(target=_poll, name="sdr-tail-poll", daemon=True)
     t.start()

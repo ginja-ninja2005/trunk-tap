@@ -3,19 +3,28 @@ Import aliases from ~/SDRTrunk/playlist/default.xml so the dashboard shows
 "County PD Dispatch" and not just talkgroup 2001.
 
 Every alias in the playlist maps a talkgroup id to a human name, group ("Law",
-"County Fire", "County EMS", ...), priority, and alias-list name (which we
-treat as the system label: "Countywide", "State P25", "City P25").
+"County Fire", "County EMS", ...) and priority, and belongs to an alias list.
+The alias list says nothing about the network by itself, so the list is mapped
+to a system through the playlist's channels: a channel names the alias list it
+uses and carries the system attribute ("Alabama Interoperable Radio System
+(AIRS)"), the same label SDRTrunk sends as systemLabel on RDIO call uploads.
+Enabled channels win; lists no channel references are skipped (reported in
+the result) rather than turned into bogus systems. LIST_TO_SYSTEM overrides
+that mapping for specific list names.
 """
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from db import db, upsert_system, upsert_talkgroup
+from db import db, upsert_system, upsert_talkgroup, canonical_system
+from ingest import eventlog
 
 _SDRTRUNK_HOME = Path(os.environ.get("SDRTRUNK_HOME", Path.home() / "SDRTrunk"))
-DEFAULT_PLAYLIST = _SDRTRUNK_HOME / "playlist" / "default.xml"
+DEFAULT_PLAYLIST = Path(os.environ.get("SDRTRUNK_PLAYLIST",
+                                       _SDRTRUNK_HOME / "playlist" / "default.xml"))
 
-# alias_list_name (from channels) -> system label we use in DB
+# alias_list_name -> system label we use in DB (explicit overrides; anything
+# not listed here is resolved from the playlist's channels)
 LIST_TO_SYSTEM = {
     "Countywide": "Countywide",
     "City P25": "City P25",
@@ -30,14 +39,26 @@ def import_from(path=DEFAULT_PLAYLIST):
     tree = ET.parse(path)
     root = tree.getroot()
 
-    n = 0
-    for alias in root.findall("alias"):
-        list_name = alias.get("list", "")
-        system_label = LIST_TO_SYSTEM.get(list_name, list_name or "unknown")
-        system_id = upsert_system(system_label)
+    list_systems = dict(eventlog.alias_list_systems(path))
+    list_systems.update(LIST_TO_SYSTEM)
 
-        name = alias.get("name")
-        group = alias.get("group")
+    n = 0
+    skipped_lists = {}
+    system_ids = {}
+    for alias in root.findall("alias"):
+        list_name = alias.get("list", "") or ""
+        system_label = list_systems.get(list_name)
+        if not system_label:
+            skipped_lists[list_name or "(none)"] = skipped_lists.get(list_name or "(none)", 0) + 1
+            continue
+        system_label = canonical_system(system_label)
+        system_id = system_ids.get(system_label)
+        if system_id is None:
+            system_id = upsert_system(system_label, protocol="APCO-25", label=system_label)
+            system_ids[system_label] = system_id
+
+        name = (alias.get("name") or "").strip() or None
+        group = (alias.get("group") or "").strip() or None
 
         tgid = None
         priority = None
@@ -60,7 +81,12 @@ def import_from(path=DEFAULT_PLAYLIST):
         upsert_talkgroup(system_id, tgid, alias=name, tg_group=group,
                          priority=priority)
         n += 1
-    return {"imported": n, "path": str(path)}
+    out = {"imported": n, "path": str(path),
+           "systems": sorted(system_ids), "lists": sorted(set(list_systems) & {
+               (a.get("list") or "") for a in root.findall("alias")})}
+    if skipped_lists:
+        out["skipped_lists"] = skipped_lists
+    return out
 
 
 if __name__ == "__main__":

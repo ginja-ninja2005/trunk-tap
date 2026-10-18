@@ -51,9 +51,13 @@ SDRTrunk event_logs/*.log ──watchdog tail─────────┘     
 - **`ingest/rdio.py`** — RDIO Scanner protocol handler (audio save, DB insert,
   live broadcast)
 - **`ingest/tail.py`** — real-time tail of SDRTrunk's `*_call_events.log` CSVs;
-  handles log rotation, truncation, and dedup by SDRTrunk's event id
-- **`ingest/aliases.py`** — imports talkgroup/radio aliases from SDRTrunk's
-  playlist XML
+  cheap folder scanning (only recently modified files are stat'ed, header-only
+  files are never opened), merges the per-event update rows SDRTrunk writes,
+  dedups by `<log start>:<EVENT_ID>`
+- **`ingest/eventlog.py`** — stdlib-only parser for log names, rows and the
+  playlist (channel → system/site); unit-tested under `tests/`
+- **`ingest/aliases.py`** — imports talkgroup aliases from SDRTrunk's playlist
+  XML, mapping each alias list to the system of the channel that uses it
 - **`ingest/whisper_worker.py`** — background transcription worker; auto-picks
   the fastest available Whisper backend
 - **`db/`** — SQLite layer (WAL mode, thread-local connections) and schema
@@ -120,10 +124,30 @@ First boot downloads the Whisper model (`ggml-small.en.bin`) into
 or a full `WHISPER_CPP_MODEL_URL`. UI at http://localhost:5544. All state
 (DB, audio, model, exports) persists in `./data/`.
 
-If SDRTrunk runs on the same machine, uncomment the read-only
-`event_logs`/`playlist`/`configuration` mounts in `docker-compose.yml` to get
-the live control-channel tail and alias import; without them only call
-uploads flow in (the tailer just skips with a warning).
+If SDRTrunk runs on the same machine, `docker-compose.yml` mounts its
+`event_logs`, `playlist`, `configuration` and `event_logs_archive` folders
+read-only, which enables the live control-channel tail and alias import
+(comment them out if SDRTrunk runs elsewhere; only call uploads flow in
+then, and the tailer just skips with a warning). Set `TZ` in the compose file
+to the zone SDRTrunk's host runs in: SDRTrunk writes event-log timestamps as
+local wall-clock time, and events only line up with the epoch-stamped RDIO
+calls (and encrypted calls only get their duration from the matching grant)
+when the container interprets them in the same zone. `SDRTRUNK_TZ` overrides
+just that interpretation if you want container logs in another zone.
+
+The system and site an event belongs to come from the playlist: the log's
+channel name (`Control`, `T-Control` for its traffic channels) is looked up
+among the playlist's channels and their `system`/`site` attributes, so events
+land under the same system label SDRTrunk sends on RDIO uploads. Without a
+readable playlist the channel name is used, and `canonical_rules` in
+`config/systems.json` can map it (e.g. `"Control"` → your system's name).
+
+To check what the parser makes of your logs without running the dashboard:
+
+```bash
+python3 scripts/check_eventlog.py ~/SDRTrunk/event_logs
+python3 -m unittest discover -s tests -t .
+```
 
 ## Point SDRTrunk at it
 
@@ -271,6 +295,7 @@ If a DB already has split identities for one network, repair it with:
 | `scripts/wipe.sh` | Wipe dashboard DB + audio (`--all-logs` also nukes SDRTrunk event logs) |
 | `scripts/patch_playlist.py` | Add an RDIO Scanner streaming target to SDRTrunk's playlist and tag every alias |
 | `scripts/merge-systems.py` | Merge split system identities in the DB into one canonical system |
+| `scripts/check_eventlog.py` | Parse SDRTrunk event logs offline and report talkgroup / encryption counts per EVENT type |
 | `scripts/tune-hackrfs.py` | Apply `config/radio_plan.json` to every HackRF in SDRTrunk's tuner config |
 | `scripts/radio_plan.py` | Shared band-plan/gain loader; run it directly to print the plan and the radios seen |
 | `scripts/sdrtrunk-launch.sh` | Kill stale SDRTrunk and relaunch with root + user home (needs the sudoers entry) |
@@ -406,10 +431,19 @@ spread across real USB 3 controllers rather than one shared hub.
 
 ## Notes
 
-- SDRTrunk logs frequency in MHz; the DB stores integer Hz.
-- Site key is the RFSS-SITE string SDRTrunk emits (e.g. `1-1`).
+- SDRTrunk logs frequency in MHz; the DB stores integer Hz (`0.000000`, which
+  SDRTrunk writes until the traffic channel is assigned, is stored as NULL).
+- `CHANNEL_NUMBER` (e.g. `0-629`) is the P25 channel identifier, not a site;
+  it is kept in `events.channel`. Sites come from the playlist channel's
+  `site` attribute.
+- SDRTrunk re-writes the same event (same `EVENT_ID`) on every update as the
+  duration grows and the talker fills in; the tailer merges those rows into
+  one event keeping the longest duration and the latest type/details.
+  `EVENT_ID` is only unique within one SDRTrunk run, so it is stored prefixed
+  with the log's start stamp.
 - Encryption flag is inferred: for RDIO calls, zero-byte audio = encrypted;
-  for event log rows, "ENCRYPT" or "SVC OPT ... ENC" in DETAILS = encrypted.
+  for event log rows, an EVENT starting with "Encrypted" or DETAILS containing
+  "ENCRYPTED" / "ENCRYPTION:" = encrypted.
 
 ## Legal & responsible use
 

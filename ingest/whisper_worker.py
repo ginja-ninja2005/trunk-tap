@@ -251,14 +251,29 @@ def backfill_duration_from_events(c, call):
         _apply_duration(c, call, row["duration_ms"])
 
 
-def backfill_durations_from_events(c, limit=25):
-    """Idle-time sweep for any call still missing a duration."""
+def backfill_durations_from_events(c, limit=200, settle_s=60):
+    """Sweep for calls still missing a duration that a logged grant can fill.
+
+    Only calls with a matching event (same system/talkgroup/radio within
+    ±30 s, duration known) are picked, within the window the event log
+    covers, so the sweep converges instead of re-trying the same unmatched
+    calls forever. Calls younger than settle_s are left alone -- their grant
+    may still be growing."""
     rows = c.execute(
-        """SELECT id, ts, system_id, tgid, source_rid
-             FROM calls WHERE duration_ms IS NULL
-            ORDER BY ts DESC LIMIT ?""", (limit,)).fetchall()
+        """SELECT c.id, c.ts, c.system_id, c.tgid, c.source_rid
+             FROM calls c
+            WHERE c.duration_ms IS NULL
+              AND c.ts < ?
+              AND c.ts >= COALESCE((SELECT MIN(ts) FROM events), 0) - 30
+              AND EXISTS (SELECT 1 FROM events e
+                           WHERE e.system_id = c.system_id AND e.to_tgid = c.tgid
+                             AND e.duration_ms IS NOT NULL
+                             AND (c.source_rid IS NULL OR e.from_rid = c.source_rid)
+                             AND e.ts BETWEEN c.ts - 30 AND c.ts + 30)
+            ORDER BY c.ts DESC LIMIT ?""", (time.time() - settle_s, limit)).fetchall()
     for call in rows:
         backfill_duration_from_events(c, call)
+    return len(rows)
 
 
 def _worker_loop(socketio=None, idle_sleep=1.5):
@@ -269,8 +284,18 @@ def _worker_loop(socketio=None, idle_sleep=1.5):
     model_desc = {"mlx-whisper": MODEL, "whisper.cpp": CPP_MODEL,
                   "openai-whisper": os.environ.get("SDRTD_WHISPER_PY_MODEL", "base")}.get(name, MODEL)
     print(f"[whisper] worker started backend={name} model={model_desc}")
+    last_event_backfill = 0.0
     while True:
         c = db()
+        # Durations from control-channel grants: run every 30 s even while a
+        # transcription backlog exists, so encrypted/audio-less calls get their
+        # air time without waiting for the queue to drain.
+        if time.time() - last_event_backfill > 30:
+            try:
+                backfill_durations_from_events(c)
+            except Exception as e:
+                print(f"[whisper] event duration backfill err: {e!r}")
+            last_event_backfill = time.time()
         row = c.execute(
             """SELECT c.id, c.audio_path, c.ts, c.tgid, c.source_rid,
                       c.frequency, c.encrypted, c.system_id,

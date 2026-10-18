@@ -158,6 +158,157 @@ def parse_int(x):
         return None
 
 
+# ---- LRRP requests -----------------------------------------------------------
+# "Motorola LRRP" events (PROTOCOL "LRRP", FROM the location server's IP, TO the
+# radio) carry the request text in DETAILS, twice: once as the event and once
+# inside the IP packet text that follows it. SDRTrunk has printed two forms:
+#
+#   legacy (nightlies up to Aug 2026): decimal id read little-endian, integer
+#   tokens read as one byte, parameters misnamed; skipped value bytes end up in
+#   UNRECOGNIZED(...):
+#     LRRP TRIGGERED LOCATION START REQUEST ID:15663103 TRIGGER ON GPIO
+#       TRIGGER EVERY:132 SECS REQUESTED TOKENS [TIME,REQUEST-64,REQUEST-62,
+#       HORIZONTAL DIRECTION,TIMESTAMP,UNRECOGNIZED(10,44,58,9C)]
+#   current (lrrp-request-varint patch): hex id as transmitted, 7-bit varints:
+#     LRRP TRIGGERED LOCATION START REQUEST ID:FFFFEE PERIODIC INTERVAL:600 SECS
+#       PARAM-42:3600 PARAM-44:100 REQUESTED TOKENS [TIME,HORIZONTAL SPEED,
+#       HORIZONTAL DIRECTION]
+#     ... ID:FFFF02 PERIODIC TRIGGER CONDITION:EMERGENCY PARAM-42:3600 ...
+#
+# parse_lrrp_request reads both and gives the request id the same way for both
+# (request_id_hex = the transmitted bytes as the current form prints them), so a
+# request profile can be followed across the SDRTrunk upgrade. Legacy trigger
+# words are kept verbatim; their real values cannot be recovered from the text.
+_LRRP_PACKET_TYPES = (
+    "TRIGGERED LOCATION START RESPONSE", "TRIGGERED LOCATION START REQUEST",
+    "TRIGGERED LOCATION STOP RESPONSE", "TRIGGERED LOCATION STOP REQUEST",
+    "IMMEDIATE LOCATION RESPONSE", "IMMEDIATE LOCATION REQUEST",
+    "PROTOCOL VERSION RESPONSE", "PROTOCOL VERSION REQUEST",
+    "TRIGGERED LOCATION",
+)
+_LRRP_TYPE_RE = re.compile(
+    r"\bLRRP (?P<type>TYPE:UNKNOWN \[\d+\]|" + "|".join(re.escape(t) for t in _LRRP_PACKET_TYPES)
+    + r")(?=\s|$)")
+_LRRP_IP_RE = re.compile(r"\s+IP FROM:")
+_LRRP_TOKEN_RE = re.compile(r"""
+    \bID:(?P<id>[0-9A-Fa-f]+)
+  | \bREQUESTED\ TOKENS\ \[(?P<requested>[^\]]*)\]
+  | \bPERIODIC\b(?P<periodic>)
+  | \bINTERVAL:(?P<interval>\d+)\ SECS
+  | \bTRIGGER\ CONDITION:(?P<condition>PTT\ EMERGENCY|PIN\ STATUS\ CHANGE|EMERGENCY|PTT|UNKNOWN\[0x[0-9A-Fa-f]+\])
+  | \bTRIGGER\ DISTANCE:(?P<distance>\d+)\ METERS
+  | \bPARAM-(?P<param_id>[0-9A-Fa-f]+):(?P<param_value>\d+)
+  | (?P<legacy>\bTRIGGER\ ON\ GPIO\b|\bTRIGGER\ ON\ MOVE\b|\bTRIGGER\ EVERY:\d+\ SECS|\bTRIGGER\ DISTANCE:\d+)
+  | (?P<other>\S+)
+""", re.X)
+_LRRP_UNRECOGNIZED_RE = re.compile(r"UNRECOGNIZED\((?P<ids>[^)]*)\)")
+# Requested-token names only one form prints (0x62: REQUEST-62 -> HORIZONTAL
+# SPEED; 0x34 is TIMESTAMP in a response but the PERIODIC flag in a request).
+_LRRP_LEGACY_NAMES = {"REQUEST-62", "TIMESTAMP"}
+_LRRP_CURRENT_NAMES = {"HORIZONTAL SPEED"}
+# The current form's trigger-condition label must not read as an emergency event.
+_LRRP_CONDITION_RE = re.compile(r"TRIGGER CONDITION:(?:PTT )?EMERGENCY")
+
+
+def find_lrrp_text(text):
+    """The first 'LRRP <type> <tokens>' run in text, without the IP text after it."""
+    m = _LRRP_TYPE_RE.search(text or "")
+    if not m:
+        return None
+    end = len(text)
+    nxt = _LRRP_TYPE_RE.search(text, m.end())
+    if nxt:
+        end = nxt.start()
+    ip = _LRRP_IP_RE.search(text, m.end(), end)
+    if ip:
+        end = ip.start()
+    return text[m.start():end].strip()
+
+
+def legacy_lrrp_id(legacy_id):
+    """Undo the legacy little-endian read: 15663103 (0xEEFFFF) -> (0xFFFFEE, 'FFFFEE').
+    The shortest byte count that holds the value is assumed."""
+    if legacy_id < 0:
+        return None, None
+    n = max(1, (legacy_id.bit_length() + 7) // 8)
+    value = int.from_bytes(legacy_id.to_bytes(n, "little"), "big")
+    return value, "%0*X" % (2 * n, value)
+
+
+def parse_lrrp_request(text, legacy=None):
+    """The first LRRP request printed in text (either form) -> dict, or None.
+
+    {"packet_type", "form" ('legacy' | 'current'), "request_id" (int, big-endian
+     as transmitted), "request_id_hex", "legacy_id" (the decimal the legacy form
+     printed), "periodic", "interval_secs", "condition", "distance_m",
+     "params" ({0x42: 3600, 0x44: 100}), "legacy_tokens", "requested",
+     "unrecognized", "other"}
+    A request showing neither form's words (digits-only id, plain token list)
+    is read as the current form unless `legacy` says otherwise.
+    """
+    run = find_lrrp_text(text)
+    if run is None:
+        return None
+    m = _LRRP_TYPE_RE.match(run)
+    r = {"packet_type": m.group("type"), "form": "current", "request_id": None,
+         "request_id_hex": None, "legacy_id": None, "periodic": False,
+         "interval_secs": None, "condition": None, "distance_m": None,
+         "params": {}, "legacy_tokens": [], "requested": [], "unrecognized": [],
+         "other": []}
+    ids = []
+    for t in _LRRP_TOKEN_RE.finditer(run[m.end():]):
+        if t.group("id") is not None:
+            ids.append(t.group("id"))
+        elif t.group("requested") is not None:
+            body = t.group("requested")
+            um = _LRRP_UNRECOGNIZED_RE.search(body)
+            if um:
+                r["unrecognized"].extend(h.strip() for h in um.group("ids").split(",") if h.strip())
+                body = body[:um.start()] + body[um.end():]
+            r["requested"].extend(n.strip() for n in body.split(",") if n.strip())
+        elif t.group("periodic") is not None:
+            r["periodic"] = True
+        elif t.group("interval") is not None:
+            r["interval_secs"] = int(t.group("interval"))
+        elif t.group("condition") is not None:
+            r["condition"] = t.group("condition")
+        elif t.group("distance") is not None:
+            r["distance_m"] = int(t.group("distance"))
+        elif t.group("param_id") is not None:
+            r["params"][int(t.group("param_id"), 16)] = int(t.group("param_value"))
+        elif t.group("legacy") is not None:
+            r["legacy_tokens"].append(t.group("legacy"))
+        else:
+            r["other"].append(t.group("other"))
+
+    # Words only the current decoder prints decide first, then words only the
+    # legacy decoder prints (it also dumped a corrupted identity token in hex, so
+    # letters in the id prove nothing); a request with neither is read as current.
+    current_words = (r["periodic"] or r["interval_secs"] is not None or r["condition"] is not None
+                     or r["distance_m"] is not None or bool(r["params"])
+                     or any(n in _LRRP_CURRENT_NAMES for n in r["requested"]))
+    legacy_words = bool(r["legacy_tokens"]) or any(n in _LRRP_LEGACY_NAMES for n in r["requested"])
+    if legacy is None:
+        legacy = legacy_words and not current_words
+    r["form"] = "legacy" if legacy else "current"
+
+    if ids:
+        first, rest = ids[0], ids[1:]
+        if legacy:
+            if first.isdigit():
+                r["legacy_id"] = int(first)
+                r["request_id"], r["request_id_hex"] = legacy_lrrp_id(r["legacy_id"])
+            else:
+                # 'ID:2200E2FF0252': the legacy build dumped the raw token of a
+                # corrupted packet; there is no identifier to recover.
+                rest.insert(0, first)
+        else:
+            r["request_id"] = int(first, 16)
+            r["request_id_hex"] = first.upper()
+        r["other"].extend("ID:" + i for i in rest)
+    return r
+
+
 def parse_freq_hz(x):
     """MHz string -> Hz int. SDRTrunk writes 0.000000 until the traffic channel
     is assigned; report that as None so a later row can fill it in."""
@@ -193,11 +344,14 @@ def classify(row):
 
     Keys: ts, duration_ms, protocol, event_type, from_rid, from_alias, to_tgid,
     to_rid, to_alias, patch_members, channel, frequency, timeslot, details,
-    event_id, encrypted (0/1), deny (bool), emergency (bool).
+    event_id, encrypted (0/1), deny (bool), emergency (bool), lrrp (the parsed
+    LRRP request for a Motorola LRRP event, see parse_lrrp_request, else None).
     Reserved FNE/broadcast addresses are never reported as radios."""
     event_type = (row.get("EVENT") or "").strip()
+    protocol = (row.get("PROTOCOL") or "").strip() or "APCO-25"
     details = row.get("DETAILS") or ""
     details_u = details.upper()
+    lrrp = parse_lrrp_request(details) if (protocol == "LRRP" or "LRRP " in details) else None
 
     from_id, from_alias, _ = parse_actor(row.get("FROM"))
     to_id, to_alias, members = parse_actor(row.get("TO"))
@@ -248,12 +402,15 @@ def classify(row):
     # TUNER UNAVAILABLE" is a receiver limitation, not a system denial.)
     deny = ("DENY" in event_type.upper() or "DENY" in details_u
             or "REFUSED" in details_u)
-    emergency = event_type.upper() == "EMERGENCY" or "EMERGENCY" in details_u
+    # An LRRP request's "TRIGGER CONDITION:EMERGENCY" is the condition under
+    # which the radio should report its position, not an emergency.
+    emergency = (event_type.upper() == "EMERGENCY"
+                 or "EMERGENCY" in _LRRP_CONDITION_RE.sub("", details_u))
 
     return {
         "ts": parse_timestamp(row.get("TIMESTAMP", "")),
         "duration_ms": parse_int(row.get("DURATION_MS")),
-        "protocol": (row.get("PROTOCOL") or "").strip() or "APCO-25",
+        "protocol": protocol,
         "event_type": event_type,
         "from_rid": from_rid,
         "from_alias": from_alias if from_rid is not None else None,
@@ -269,6 +426,7 @@ def classify(row):
         "encrypted": encrypted,
         "deny": deny,
         "emergency": emergency,
+        "lrrp": lrrp,
     }
 
 

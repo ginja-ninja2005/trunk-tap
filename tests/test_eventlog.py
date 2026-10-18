@@ -285,6 +285,120 @@ class PlaylistTests(unittest.TestCase):
         self.assertEqual(E.alias_list_systems("/nonexistent/default.xml"), {})
 
 
+# The two LRRP request profiles on this system as the patched SDRTrunk (lrrp-request-varint)
+# prints them; the strings are the ones SDRTrunk's own LRRPPacketTest asserts.
+LRRP_PERIODIC = ("LRRP TRIGGERED LOCATION START REQUEST ID:FFFFEE PERIODIC INTERVAL:600 SECS PARAM-42:3600 "
+                 "PARAM-44:100 REQUESTED TOKENS [TIME,HORIZONTAL SPEED,HORIZONTAL DIRECTION]")
+LRRP_EMERGENCY = ("LRRP TRIGGERED LOCATION START REQUEST ID:FFFF02 PERIODIC TRIGGER CONDITION:EMERGENCY "
+                  "PARAM-42:3600 PARAM-44:100 REQUESTED TOKENS [TIME,HORIZONTAL SPEED,HORIZONTAL DIRECTION]")
+# The same two as the August 2026 nightly printed them (real lines).
+LRRP_LEGACY_PERIODIC = ("LRRP TRIGGERED LOCATION START REQUEST ID:15663103 TRIGGER ON GPIO TRIGGER EVERY:132 SECS "
+                        "REQUESTED TOKENS [TIME,REQUEST-64,REQUEST-62,HORIZONTAL DIRECTION,TIMESTAMP,UNRECOGNIZED(10,44,58,9C)]")
+LRRP_LEGACY_EMERGENCY = ("LRRP TRIGGERED LOCATION START REQUEST ID:196607 TRIGGER ON GPIO TRIGGER DISTANCE:2 "
+                         "REQUESTED TOKENS [TIME,REQUEST-64,REQUEST-62,HORIZONTAL DIRECTION,TIMESTAMP,UNRECOGNIZED(10,44,9C)]")
+
+
+def _lrrp_details(request, radio_ip="10.71.195.19"):
+    """DETAILS as SDRTrunk writes it for a Motorola LRRP event: the request, then the IP packet text."""
+    return "%s IP FROM:10.51.4.116 TO:%s UDP PORT FROM:4001 TO:4001 %s" % (request, radio_ip, request)
+
+
+def _lrrp_row(request, to=" (4006363)"):
+    row = _row("Motorola LRRP", "10.51.4.116", to, _lrrp_details(request), chan="0-857", freq="856.362500")
+    row["PROTOCOL"] = "LRRP"
+    return row
+
+
+class LRRPTests(unittest.TestCase):
+    def test_current_form(self):
+        r = E.parse_lrrp_request(LRRP_PERIODIC)
+        self.assertEqual((r["packet_type"], r["form"]), ("TRIGGERED LOCATION START REQUEST", "current"))
+        self.assertEqual((r["request_id"], r["request_id_hex"], r["legacy_id"]), (0xFFFFEE, "FFFFEE", None))
+        self.assertEqual((r["periodic"], r["interval_secs"], r["condition"], r["distance_m"]), (True, 600, None, None))
+        self.assertEqual(r["params"], {0x42: 3600, 0x44: 100})
+        self.assertEqual(r["requested"], ["TIME", "HORIZONTAL SPEED", "HORIZONTAL DIRECTION"])
+        self.assertEqual((r["unrecognized"], r["legacy_tokens"], r["other"]), ([], [], []))
+        r = E.parse_lrrp_request(LRRP_EMERGENCY)
+        self.assertEqual((r["request_id_hex"], r["periodic"], r["interval_secs"], r["condition"]),
+                         ("FFFF02", True, None, "EMERGENCY"))
+        r = E.parse_lrrp_request("LRRP TYPE:UNKNOWN [163] ID:FFFFEE PERIODIC INTERVAL:600 SECS PARAM-42:3600 "
+                                 "PARAM-44:100 REQUESTED TOKENS [TIME,HORIZONTAL SPEED,HORIZONTAL DIRECTION]")
+        self.assertEqual((r["packet_type"], r["request_id_hex"], r["interval_secs"]), ("TYPE:UNKNOWN [163]", "FFFFEE", 600))
+        r = E.parse_lrrp_request("LRRP TRIGGERED LOCATION START REQUEST ID:0A TRIGGER DISTANCE:150 METERS "
+                                 "TRIGGER CONDITION:PTT EMERGENCY REQUEST-73:4 REQUESTED TOKENS [TIME]")
+        self.assertEqual((r["request_id"], r["distance_m"], r["condition"], r["other"]), (10, 150, "PTT EMERGENCY", ["REQUEST-73:4"]))
+        self.assertEqual(E.parse_lrrp_request("LRRP PROTOCOL VERSION REQUEST")["request_id"], None)
+        self.assertIsNone(E.parse_lrrp_request("ARS REGISTRATION SUCCESS REFRESH IN:240mins"))
+        self.assertIsNone(E.parse_lrrp_request(""))
+
+    def test_legacy_form(self):
+        r = E.parse_lrrp_request(LRRP_LEGACY_PERIODIC)
+        self.assertEqual((r["form"], r["legacy_id"], r["request_id"], r["request_id_hex"]),
+                         ("legacy", 15663103, 0xFFFFEE, "FFFFEE"))
+        self.assertEqual(r["legacy_tokens"], ["TRIGGER ON GPIO", "TRIGGER EVERY:132 SECS"])
+        self.assertEqual((r["periodic"], r["interval_secs"], r["params"]), (False, None, {}))
+        self.assertEqual(r["requested"], ["TIME", "REQUEST-64", "REQUEST-62", "HORIZONTAL DIRECTION", "TIMESTAMP"])
+        self.assertEqual(r["unrecognized"], ["10", "44", "58", "9C"])
+        r = E.parse_lrrp_request(LRRP_LEGACY_EMERGENCY)
+        self.assertEqual((r["request_id_hex"], r["legacy_tokens"], r["distance_m"]),
+                         ("FFFF02", ["TRIGGER ON GPIO", "TRIGGER DISTANCE:2"], None))
+        # Corrupted packets: a raw token dump instead of an id, or a second id
+        r = E.parse_lrrp_request("LRRP TRIGGERED LOCATION START REQUEST ID:2200E2FF0252 TRIGGER ON GPIO "
+                                 "REQUESTED TOKENS [TIME,REQUEST-64,UNKNOWN 23,UNRECOGNIZED(02,02,03,2E,44,60,9C,AE,E2,FF)]")
+        self.assertEqual((r["form"], r["request_id_hex"], r["other"]), ("legacy", None, ["ID:2200E2FF0252"]))
+        self.assertEqual(r["requested"], ["TIME", "REQUEST-64", "UNKNOWN 23"])
+        r = E.parse_lrrp_request("LRRP TRIGGERED LOCATION START REQUEST ID:196607 ID:227200000000 TRIGGER ON GPIO "
+                                 "REQUESTED TOKENS [TIME,REQUEST-64,UNRECOGNIZED(10,17,44,74,9C,F6)]")
+        self.assertEqual((r["request_id_hex"], r["other"]), ("FFFF02", ["ID:227200000000"]))
+
+    def test_same_id_in_both_forms(self):
+        self.assertEqual(E.parse_lrrp_request(LRRP_LEGACY_PERIODIC)["request_id_hex"],
+                         E.parse_lrrp_request(LRRP_PERIODIC)["request_id_hex"])
+        self.assertEqual(E.parse_lrrp_request(LRRP_LEGACY_EMERGENCY)["request_id_hex"],
+                         E.parse_lrrp_request(LRRP_EMERGENCY)["request_id_hex"])
+        self.assertEqual(E.legacy_lrrp_id(15663103), (0xFFFFEE, "FFFFEE"))
+        self.assertEqual(E.legacy_lrrp_id(196607), (0xFFFF02, "FFFF02"))
+        self.assertEqual(E.legacy_lrrp_id(65503), (0xDFFF, "DFFF"))
+        self.assertEqual(E.legacy_lrrp_id(0), (0, "00"))
+        # Digits-only id without either form's words: current unless told otherwise
+        text = "LRRP TRIGGERED LOCATION START REQUEST ID:196607 REQUESTED TOKENS [TIME]"
+        self.assertEqual(E.parse_lrrp_request(text)["request_id_hex"], "196607")
+        self.assertEqual(E.parse_lrrp_request(text, legacy=True)["request_id_hex"], "FFFF02")
+
+    def test_details_column_is_read_once(self):
+        details = _lrrp_details(LRRP_PERIODIC)
+        self.assertEqual(E.find_lrrp_text(details), LRRP_PERIODIC)
+        self.assertEqual(E.parse_lrrp_request(details)["other"], [])
+
+    def test_classify_both_forms(self):
+        for request, form, rid in ((LRRP_PERIODIC, "current", "FFFFEE"), (LRRP_EMERGENCY, "current", "FFFF02"),
+                                   (LRRP_LEGACY_PERIODIC, "legacy", "FFFFEE"), (LRRP_LEGACY_EMERGENCY, "legacy", "FFFF02")):
+            e = E.classify(_lrrp_row(request))
+            self.assertEqual((e["protocol"], e["event_type"], e["from_rid"], e["to_rid"], e["to_tgid"]),
+                             ("LRRP", "Motorola LRRP", None, 4006363, None), request)
+            self.assertEqual(e["details"], _lrrp_details(request))        # kept verbatim, brackets and commas included
+            self.assertEqual((e["encrypted"], e["deny"], e["emergency"]), (0, False, False), request)
+            self.assertEqual((e["lrrp"]["form"], e["lrrp"]["request_id_hex"]), (form, rid), request)
+        # Real legacy row from the fixture
+        rows = [r for r in _rows() if r["EVENT"] == "Motorola LRRP" and "ID:196607 TRIGGER ON GPIO TRIGGER DISTANCE:2" in r["DETAILS"]]
+        self.assertTrue(rows)
+        e = E.classify(rows[0])
+        self.assertEqual((e["to_rid"], e["lrrp"]["form"], e["lrrp"]["request_id_hex"]), (4006361, "legacy", "FFFF02"))
+
+    def test_trigger_condition_is_not_an_emergency(self):
+        e = E.classify(_lrrp_row(LRRP_EMERGENCY))
+        self.assertFalse(e["emergency"])
+        # The same request text inside a Data Packet event (PROTOCOL APCO-25)
+        e = E.classify(_row("Data Packet", "", " (4006363)", "NAC:1120/x460 IPPKT LLID:4006363 NSAPI:1 " + _lrrp_details(LRRP_EMERGENCY)))
+        self.assertEqual((e["emergency"], e["lrrp"]["request_id_hex"]), (False, "FFFF02"))
+        # Real emergencies still count
+        e = E.classify(_row("EMERGENCY", "4007399", "[Brmnghm Police W] (3155)", "RADIO EMERGENCY ALARM ACTIVATION"))
+        self.assertTrue(e["emergency"])
+        e = E.classify(_row("Group Call", "4007399", " (3155)", "PHASE 1 CHANNEL GRANT EMERGENCY"))
+        self.assertTrue(e["emergency"])
+        self.assertIsNone(e["lrrp"])
+
+
 def _real_control_files():
     roots = [os.environ.get("SDRTRUNK_EVENT_LOGS")] if os.environ.get("SDRTRUNK_EVENT_LOGS") else []
     home = Path(os.environ.get("SDRTRUNK_HOME", Path.home() / "SDRTrunk"))

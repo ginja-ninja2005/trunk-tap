@@ -444,6 +444,14 @@ spread across real USB 3 controllers rather than one shared hub.
 - Encryption flag is inferred: for RDIO calls, zero-byte audio = encrypted;
   for event log rows, an EVENT starting with "Encrypted" or DETAILS containing
   "ENCRYPTED" / "ENCRYPTION:" = encrypted.
+- `Motorola LRRP` events (PROTOCOL `LRRP`) carry the location request in
+  DETAILS, twice (the event text, then the IP packet text). SDRTrunk has
+  printed it in two forms, the August 2026 nightly's `ID:196607 TRIGGER ON
+  GPIO ...` and the patched decoder's `ID:FFFF02 PERIODIC TRIGGER
+  CONDITION:EMERGENCY PARAM-42:3600 ...`; `eventlog.parse_lrrp_request`
+  reads both, gives the request id the same way for both (`FFFF02`), and
+  `classify` returns it as `lrrp`. A request's `TRIGGER CONDITION:EMERGENCY`
+  does not set the event's emergency flag.
 - SDRTrunk's RDIO upload also carries the radio's Motorola **talker alias**
   (`talkerAlias`, free text such as `BC911 4165226`; present on every upload,
   usually empty). It is kept per call in `calls.talker_alias` (trimmed, a
